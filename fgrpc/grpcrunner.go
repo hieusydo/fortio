@@ -28,12 +28,17 @@ import (
 	"fortio.org/fortio/fnet"
 	"fortio.org/fortio/periodic"
 	"fortio.org/log"
+	"github.com/jhump/protoreflect/grpcreflect"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 // Dial dials gRPC using insecure or TLS transport security when serverAddr
@@ -81,6 +86,10 @@ type GRPCRunnerResults struct {
 	Streams     int
 	Ping        bool
 	Metadata    metadata.MD
+	// NEW: for dynamic
+	UseDynamic  bool
+	GRPCMethod  string
+	GRPCPayload string
 }
 
 // Run exercises GRPC health check or ping at the target QPS.
@@ -116,6 +125,82 @@ func (grpcstate *GRPCRunnerResults) Run(outCtx context.Context, t periodic.Threa
 	return false, status.String()
 }
 
+// dynamicGRPCCall performs a dynamic unary gRPC call using reflection and protoreflect.
+func dynamicGRPCCall(ctx context.Context, conn *grpc.ClientConn, fullMethod, jsonPayload string) (string, error) {
+	// Setup reflection client
+	refClient := grpcreflect.NewClientAuto(ctx, conn)
+	defer refClient.Reset()
+
+	log.Infof("fullMethod: %v", fullMethod)
+	log.Infof("jsonPayload: %v", jsonPayload)
+
+	// Parse method name
+	serviceName, methodName, err := parseFullMethod(fullMethod)
+	if err != nil {
+		return "", err
+	}
+	// Find service and method descriptor
+	sd, err := refClient.ResolveService(serviceName)
+	if err != nil {
+		return "", err
+	}
+	md := sd.FindMethodByName(methodName)
+	if md == nil {
+		return "", fmt.Errorf("method %s not found in service %s", methodName, serviceName)
+	}
+	// Bridge to protobuf v2 descriptor
+	inputFQN := protoreflect.FullName(md.GetInputType().GetFullyQualifiedName())
+	inputType, err := protoregistry.GlobalTypes.FindMessageByName(inputFQN)
+	if err != nil {
+		return "", fmt.Errorf("could not find input message type for %s: %w", inputFQN, err)
+	}
+	log.Infof("inputFQN: %v", inputFQN)
+	log.Infof("inputType: %v", inputType)
+	inMsg := dynamicpb.NewMessage(inputType.Descriptor())
+	if err := protojson.Unmarshal([]byte(jsonPayload), inMsg); err != nil {
+		return "", fmt.Errorf("failed to unmarshal JSON payload: %w", err)
+	}
+	log.Infof("inMsg: %v", inMsg)
+
+	outputFQN := protoreflect.FullName(md.GetOutputType().GetFullyQualifiedName())
+	outputType, err := protoregistry.GlobalTypes.FindMessageByName(outputFQN)
+	log.Infof("outputFQN: %v", outputFQN)
+	log.Infof("outputType: %v", outputType)
+	if err != nil {
+		return "", fmt.Errorf("could not find output message type for %s: %w", outputFQN, err)
+	}
+
+	outMsg := dynamicpb.NewMessage(outputType.Descriptor())
+	methodPath := fmt.Sprintf("/%s/%s", serviceName, methodName)
+	log.Infof("methodPath: %v", methodPath)
+	if inMsg == nil {
+		log.Errf("inMsg is nil!")
+
+	}
+	inMsg = dynamicpb.NewMessage(inputType.Descriptor())
+
+	if err := conn.Invoke(ctx, methodPath, inMsg, outMsg); err != nil {
+		return "", fmt.Errorf("gRPC invoke error: %w", err)
+	}
+	respBytes, err := protojson.Marshal(outMsg)
+	log.Infof("respBytes: %v", string(respBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	log.Infof("RETURNINGGGGGG")
+	return string(respBytes), nil
+}
+
+// parseFullMethod splits "Service/Method" or "/Service/Method" into service and method.
+func parseFullMethod(full string) (string, string, error) {
+	trimmed := strings.TrimPrefix(full, "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid method format: want Service/Method, got %q", full)
+	}
+	return parts[0], parts[1], nil
+}
+
 // GRPCRunnerOptions includes the base RunnerOptions plus gRPC specific
 // options.
 type GRPCRunnerOptions struct {
@@ -130,6 +215,9 @@ type GRPCRunnerOptions struct {
 	CertOverride       string            // Override the cert virtual host of authority for testing
 	AllowInitialErrors bool              // whether initial errors don't cause an abort
 	UsePing            bool              // use our own Ping proto for gRPC load instead of standard health check one.
+	UseDynamic         bool              // NEW: use dynamic reflection-based method invocation
+	GRPCMethod         string            // NEW: full method name (e.g. Service/Method)
+	GRPCPayload        string            // NEW: JSON payload for dynamic method
 	Metadata           metadata.MD       // input metadata that will be added to the request
 	dialOptions        []grpc.DialOption // gRPC dial options extracted from Metadata (authority and user-agent extracted)
 	filteredMetadata   metadata.MD       // filtered version of Metadata metadata (without authority and user-agent)
@@ -140,6 +228,49 @@ type GRPCRunnerOptions struct {
 //
 //nolint:funlen, gocognit, gocyclo
 func RunGRPCTest(o *GRPCRunnerOptions) (*GRPCRunnerResults, error) {
+	if o.UseDynamic {
+		log.Infof("UseDynamic for %v", o.Service)
+
+		// Dynamic gRPC: single call, no periodic runner
+		conn, err := Dial(o)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		ctx := context.Background()
+		o.dialOptions, o.filteredMetadata = extractDialOptionsAndFilter(o.Metadata)
+		if o.filteredMetadata.Len() != 0 {
+			ctx = metadata.NewOutgoingContext(ctx, o.filteredMetadata)
+		}
+		retCodes := make(HealthResultMap)
+		_, err = dynamicGRPCCall(ctx, conn, o.GRPCMethod, o.GRPCPayload)
+		if err != nil {
+			retCodes[Error]++
+			return &GRPCRunnerResults{
+				RetCodes:    retCodes,
+				Destination: o.Destination,
+				UseDynamic:  true,
+				GRPCMethod:  o.GRPCMethod,
+				GRPCPayload: o.GRPCPayload,
+				RunnerResults: periodic.RunnerResults{
+					RunType: "Dynamic gRPC",
+					Labels:  o.Labels,
+				},
+			}, err
+		}
+		retCodes["OK"]++
+		return &GRPCRunnerResults{
+			RetCodes:    retCodes,
+			Destination: o.Destination,
+			UseDynamic:  true,
+			GRPCMethod:  o.GRPCMethod,
+			GRPCPayload: o.GRPCPayload,
+			RunnerResults: periodic.RunnerResults{
+				RunType: "Dynamic gRPC",
+				Labels:  o.Labels,
+			},
+		}, nil
+	}
 	if o.Streams < 1 {
 		o.Streams = 1
 	}
@@ -152,6 +283,9 @@ func RunGRPCTest(o *GRPCRunnerOptions) (*GRPCRunnerResults, error) {
 		if o.Delay > 0 {
 			o.RunType += fmt.Sprintf(" Delay=%v", o.Delay)
 		}
+	} else if o.UseDynamic {
+		// Already handled above
+		log.Infof("UseDynamic for %v", o.Service)
 	} else {
 		o.RunType = "GRPC Health for '" + o.Service + "'"
 	}
@@ -178,6 +312,9 @@ func RunGRPCTest(o *GRPCRunnerOptions) (*GRPCRunnerResults, error) {
 		Streams:     o.Streams,
 		Ping:        o.UsePing,
 		Metadata:    o.Metadata, // the original one
+		UseDynamic:  o.UseDynamic,
+		GRPCMethod:  o.GRPCMethod,
+		GRPCPayload: o.GRPCPayload,
 	}
 	grpcstate := make([]GRPCRunnerResults, numThreads)
 	out := r.Options().Out // Important as the default value is set from nil to stdout inside NewPeriodicRunner
@@ -197,6 +334,9 @@ func RunGRPCTest(o *GRPCRunnerOptions) (*GRPCRunnerResults, error) {
 			log.Debugf("Reusing previous client connection for %d", i)
 		}
 		grpcstate[i].Ping = o.UsePing
+		grpcstate[i].UseDynamic = false // always false in thread mode
+		grpcstate[i].GRPCMethod = ""
+		grpcstate[i].GRPCPayload = ""
 		var err error
 		outCtx := context.Background()
 		if o.filteredMetadata.Len() != 0 {

@@ -19,8 +19,11 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"errors"
 
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/fnet"
@@ -561,5 +564,47 @@ func TestHeaderHandling(t *testing.T) {
 				t.Errorf("got md = %v, want %v", tt.args.in, tt.wantMD)
 			}
 		})
+	}
+}
+
+func TestParseFullMethod(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantSvc  string
+		wantMeth string
+		wantErr  bool
+	}{
+		{"Service/Method", "Service", "Method", false},
+		{"/Service/Method", "Service", "Method", false},
+		{"ServiceOnly", "", "", true},
+		{"/ServiceOnly", "", "", true},
+		{"", "", "", true},
+	}
+	for _, tc := range tests {
+		svc, meth, err := parseFullMethod(tc.input)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parseFullMethod(%q) error = %v, wantErr %v", tc.input, err, tc.wantErr)
+		}
+		if svc != tc.wantSvc || meth != tc.wantMeth {
+			t.Errorf("parseFullMethod(%q) = (%q, %q), want (%q, %q)", tc.input, svc, meth, tc.wantSvc, tc.wantMeth)
+		}
+	}
+}
+
+// mockConn is a minimal grpc.ClientConnInterface for error path testing
+type mockConn struct{}
+
+func (m *mockConn) Invoke(ctx context.Context, method string, args, reply interface{}, opts ...grpc.CallOption) error {
+	return errors.New("mock invoke error")
+}
+func (m *mockConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	return nil, errors.New("not implemented")
+}
+
+func TestDynamicGRPCCall_InvalidMethod(t *testing.T) {
+	// This test checks error handling for invalid method format
+	_, err := dynamicGRPCCall(context.Background(), nil, "InvalidMethodFormat", `{}`)
+	if err == nil || !strings.Contains(err.Error(), "invalid method format") {
+		t.Errorf("expected invalid method format error, got %v", err)
 	}
 }

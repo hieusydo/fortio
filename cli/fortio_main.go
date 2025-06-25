@@ -153,6 +153,10 @@ var (
 		"`format` for access log. Supported values: [json, influx]")
 	calcQPS = flag.Bool("calc-qps", false, "Calculate the qps based on number of requests (-n) and duration (-t)")
 	pprofOn = flag.Bool("pprof", false, "Enable pprof HTTP endpoint in the Web UI handler server")
+
+	// Dynamic gRPC flags
+	grpcMethodFlag  = flag.String("grpc-method", "helloworld.Greeter/SayHello", "Full gRPC method to call (Service/Method), enables dynamic gRPC mode if set")
+	grpcPayloadFlag = flag.String("grpc-payload", "{}", "JSON payload for dynamic gRPC method (default: empty object)")
 )
 
 // serverArgCheck always returns true after checking arguments length.
@@ -442,6 +446,14 @@ func fortioLoad(justCurl bool, percList []float64) {
 			Profiler:           *profileFlag,
 		}
 		o.TLSOptions = httpOpts.TLSOptions
+		// Enable dynamic gRPC if grpc-method is set
+		log.Infof("grpcMethodFlag: %v", *grpcMethodFlag)
+		log.Infof("grpcPayloadFlag: %v", *grpcPayloadFlag)
+		if *grpcMethodFlag != "" {
+			o.UseDynamic = true
+			o.GRPCMethod = *grpcMethodFlag
+			o.GRPCPayload = *grpcPayloadFlag
+		}
 		res, err = fgrpc.RunGRPCTest(&o)
 	case strings.HasPrefix(url, tcprunner.TCPURLPrefix):
 		o := tcprunner.RunnerOptions{
